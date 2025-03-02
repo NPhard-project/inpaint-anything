@@ -20,7 +20,7 @@ import numpy as np
 import torch
 from diffusers import (DDIMScheduler, EulerAncestralDiscreteScheduler, EulerDiscreteScheduler,
                        KDPM2AncestralDiscreteScheduler, KDPM2DiscreteScheduler,
-                       StableDiffusionInpaintPipeline)
+                       StableDiffusionInpaintPipeline, ControlNetModel, StableDiffusionControlNetInpaintPipeline)
 from PIL import Image, ImageFilter
 from PIL.PngImagePlugin import PngInfo
 from torch.hub import download_url_to_file
@@ -358,6 +358,16 @@ def auto_resize_to_pil(input_image, mask_image):
 
     return init_image, mask_image
 
+# コントロールイメージを作成するメソッド
+def make_inpaint_condition(image, image_mask):
+    image = np.array(image.convert("RGB")).astype(np.float32) / 255.0
+    image_mask = np.array(image_mask.convert("L")).astype(np.float32) / 255.0
+
+    assert image.shape[0:1] == image_mask.shape[0:1], "image and image_mask must have the same image size"
+    image[image_mask > 0.5] = -1.0  # set as masked pixel
+    image = np.expand_dims(image, 0).transpose(0, 3, 1, 2)
+    image = torch.from_numpy(image)
+    return image
 
 @clear_cache_decorator
 def run_inpaint(input_image, sel_mask, prompt, n_prompt, ddim_steps, cfg_scale, seed, inp_model_id, save_mask_chk, composite_chk,
@@ -390,30 +400,47 @@ def run_inpaint(input_image, sel_mask, prompt, n_prompt, ddim_steps, cfg_scale, 
         local_files_only = True
         ia_logging.info("local_files_only: {}".format(str(local_files_only)))
 
-    if platform.system() == "Darwin" or devices.device == devices.cpu or ia_check_versions.torch_on_amd_rocm:
+    # if platform.system() == "Darwin" or devices.device == devices.cpu or ia_check_versions.torch_on_amd_rocm:
+    if (platform.system() == "Darwin" and not torch.backends.mps.is_available()) or devices.device == devices.cpu or ia_check_versions.torch_on_amd_rocm:
         torch_dtype = torch.float32
     else:
         torch_dtype = torch.float16
 
+    is_controlnet = False
     try:
-        pipe = StableDiffusionInpaintPipeline.from_pretrained(
-            inp_model_id, torch_dtype=torch_dtype, local_files_only=local_files_only, use_safetensors=True)
+        controlnet = ControlNetModel.from_pretrained(
+            # "lllyasviel/control_v11p_sd15_mlsd",
+            "lllyasviel/control_v11p_sd15_inpaint",
+            torch_dtype=torch.float16
+        )
+        pipe = StableDiffusionControlNetInpaintPipeline.from_pretrained(
+            "runwayml/stable-diffusion-v1-5",
+            torch_dtype=torch.float16,
+            controlnet=controlnet,
+        )
+        control_image = make_inpaint_condition(input_image, mask_image)
+        is_controlnet = True
     except Exception as e:
         ia_logging.error(str(e))
-        if not config_offline_inpainting:
-            try:
-                pipe = StableDiffusionInpaintPipeline.from_pretrained(
-                    inp_model_id, torch_dtype=torch_dtype, use_safetensors=True)
-            except Exception as e:
-                ia_logging.error(str(e))
-                try:
-                    pipe = StableDiffusionInpaintPipeline.from_pretrained(
-                        inp_model_id, torch_dtype=torch_dtype, force_download=True, use_safetensors=True)
-                except Exception as e:
-                    ia_logging.error(str(e))
-                    return
-        else:
-            return
+        raise Exception(e)
+        # try:
+        #     pipe = StableDiffusionInpaintPipeline.from_pretrained(
+        #         pretrained_model_name_or_path=inp_model_id, torch_dtype=torch_dtype, local_files_only=local_files_only, use_safetensors=True)
+        # except:
+        #     if not config_offline_inpainting:
+        #         try:
+        #             pipe = StableDiffusionInpaintPipeline.from_pretrained(
+        #                 inp_model_id, torch_dtype=torch_dtype, use_safetensors=True)
+        #         except Exception as e:
+        #             ia_logging.error(str(e))
+        #             try:
+        #                 pipe = StableDiffusionInpaintPipeline.from_pretrained(
+        #                     inp_model_id, torch_dtype=torch_dtype, force_download=True, use_safetensors=True)
+        #             except Exception as e:
+        #                 ia_logging.error(str(e))
+        #                 return
+        #     else:
+        #         return
     pipe.safety_checker = None
 
     ia_logging.info(f"Using sampler {sampler_name}")
@@ -464,17 +491,31 @@ def run_inpaint(input_image, sel_mask, prompt, n_prompt, ddim_steps, cfg_scale, 
 
         generator = torch_generator.manual_seed(seed)
 
-        pipe_args_dict = {
-            "prompt": prompt,
-            "image": init_image,
-            "width": width,
-            "height": height,
-            "mask_image": mask_image,
-            "num_inference_steps": ddim_steps,
-            "guidance_scale": cfg_scale,
-            "negative_prompt": n_prompt,
-            "generator": generator,
-        }
+        if is_controlnet:
+            pipe_args_dict = {
+                "prompt": prompt,
+                "image": init_image,
+                "width": width,
+                "height": height,
+                "mask_image": mask_image,
+                "num_inference_steps": ddim_steps,
+                "guidance_scale": cfg_scale,
+                "negative_prompt": n_prompt,
+                "generator": generator,
+                "control_image": control_image
+            }
+        else:
+            pipe_args_dict = {
+                "prompt": prompt,
+                "image": init_image,
+                "width": width,
+                "height": height,
+                "mask_image": mask_image,
+                "num_inference_steps": ddim_steps,
+                "guidance_scale": cfg_scale,
+                "negative_prompt": n_prompt,
+                "generator": generator,
+            }
 
         output_image = pipe(**pipe_args_dict).images[0]
 
